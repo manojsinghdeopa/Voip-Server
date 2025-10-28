@@ -1,3 +1,5 @@
+
+
 import { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";
 import { connections, callMap } from "./connection-registry.js";
@@ -9,7 +11,6 @@ const WS_PORT = process.env.WS_PORT || 8081;
 const wss = new WebSocketServer({ port: WS_PORT });
 console.log(`WebSocket server running on ws://localhost:${WS_PORT}`);
 
-const CALL_HANDLER_URL = `http://localhost:${process.env.PORT || 8080}/start-call`;
 
 export function sendToUser(userId, data) {
   const ws = connections.get(userId);
@@ -20,12 +21,13 @@ export function sendToUser(userId, data) {
 }
 
 wss.on("connection", (ws) => {
-  console.log("Client connected");
 
+  console.log("Client connected");
   ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       switch (msg.type) {
+
         case "register":
           ws.userId = msg.userId;
           connections.set(msg.userId, ws);
@@ -33,20 +35,20 @@ wss.on("connection", (ws) => {
           console.log(`Registered ${msg.userId}`);
           break;
 
+
         case "initiate_call": {
           const callId = uuidv4();
           callMap.set(callId, { userId: ws.userId, ws });
-          // Insert call log via backend restful endpoint? We'll save in call-handler if desired.
           ws.send(JSON.stringify({ type: "call_initiated", callId, to: msg.to }));
-          // Tell call-handler to start real call via Twilio
           try {
-            const res = await fetch(CALL_HANDLER_URL, {
+            const res = await fetch(`http://localhost:${process.env.PORT || 8080}/start-call`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ callId, to: msg.to, from: msg.from || process.env.TWILIO_PHONE_NUMBER })
             });
             const json = await res.json();
             console.log("start-call response:", json);
+
             // Map Twilio SID to callId if available
             if (json.sid) {
               const entry = callMap.get(callId) || {};
@@ -61,8 +63,6 @@ wss.on("connection", (ws) => {
         }
 
         case "answer_call": {
-          // inform call-handler to connect inbound call or perform action
-          // For simple flows, just forward to call-handler
           await fetch(`http://localhost:${process.env.PORT || 8080}/connect-call`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -72,7 +72,6 @@ wss.on("connection", (ws) => {
         }
 
         case "hangup": {
-          // call-handler can hang up by Twilio SID
           await fetch(`http://localhost:${process.env.PORT || 8080}/hangup`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -83,6 +82,7 @@ wss.on("connection", (ws) => {
 
         default:
           ws.send(JSON.stringify({ type: "error", message: "Unknown type" }));
+
       }
     } catch (err) {
       console.error("WS message handling error:", err);
@@ -91,9 +91,11 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+
     if (ws.userId) {
       connections.delete(ws.userId);
       console.log(`${ws.userId} disconnected`);
     }
+
   });
 });

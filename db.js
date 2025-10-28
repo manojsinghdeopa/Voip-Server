@@ -11,15 +11,21 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS call_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  call_id TEXT,
-  twilio_sid TEXT,
+  call_id TEXT UNIQUE,
+  twilio_sid TEXT UNIQUE,
   from_user TEXT,
   to_user TEXT,
   direction TEXT,
   status TEXT,
+  error_message TEXT,
   started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   ended_at DATETIME
 );
+
+CREATE INDEX IF NOT EXISTS idx_call_id ON call_logs (call_id);
+CREATE INDEX IF NOT EXISTS idx_twilio_sid ON call_logs (twilio_sid);
+
 `);
+
 
 export default db;

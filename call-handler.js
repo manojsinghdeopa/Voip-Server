@@ -7,6 +7,7 @@ import { sendIncomingCallPush } from "./fcm.js";
 import { getUserByPhone, getUser } from "./user-service.js";
 import { connections } from "./connection-registry.js";
 import { v4 as uuidv4 } from "uuid";
+import { createCallLog, linkTwilioSid, updateCallStatusById, updateCallStatusBySid, getCallById, getCallBySid } from "./call-service.js";
 
 dotenv.config();
 const router = express.Router();
@@ -16,136 +17,176 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 router.use(bodyParser.json());
 router.use(bodyParser.urlencoded({ extended: false }));
 
-// Start a real outbound call via Twilio
+
+
+
+// Start a outbound call
 router.post("/start-call", async (req, res) => {
-  const { to, from, callId } = req.body;
+  const { to, from } = req.body;
+  const callId = uuidv4();
+
+  // 1. Create initial call record before contacting Twilio
+  createCallLog(callId, from, to, "outbound", "initiated");
+
   try {
     const call = await client.calls.create({
       to,
       from,
       url: "https://handler.twilio.com/twiml/EHd84aaf5d7cbc581e6bb9e9ba48ac8e9a", // replace with your TwiML or Twiml Bin
-      statusCallback: `http://localhost:${process.env.PORT || 8080}/twilio-status`,
+      statusCallback: `${process.env.PUBLIC_URL}/twilio-status` || `http://localhost:${process.env.PORT || 8080}/twilio-status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
 
-    // Save call log
-    const sid = call.sid;
-    db.prepare(`
-      INSERT INTO call_logs (call_id, twilio_sid, from_user, to_user, direction, status)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(callId, sid, "system", to, "outbound", "initiated");
+    // 2. Store Twilio SID ↔ call_id mapping
+    linkTwilioSid(callId, call.sid);
 
-    res.json({ success: true, sid: sid });
+    console.log(`📞 Outbound call started: ${call.sid} <-> ${callId}`);
+    res.json({ success: true, callId, sid: call.sid });
+
+
   } catch (err) {
-    console.error("start-call error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error("❌ Twilio call initiation failed:", err.message);
+    updateCallStatusById(callId, "failed", err.message);
+    res.status(500).json({ success: false, callId, error: err.message });
   }
 });
+
+
+
 
 // Twilio webhooks for call status updates
 router.post("/twilio-status", (req, res) => {
-  const { CallSid, CallStatus } = req.body;
-  console.log("Twilio status:", CallSid, CallStatus);
-  // Update call_logs by twilio_sid
-  const stmt = db.prepare("UPDATE call_logs SET status = ?, ended_at = CURRENT_TIMESTAMP WHERE twilio_sid = ?");
-  stmt.run(CallStatus, CallSid);
 
-  // Optionally notify connected user by mapping twilio_sid -> callId (not implemented fully)
-  // A simple brute-force: find call with twilio_sid
-  const callRow = db.prepare("SELECT * FROM call_logs WHERE twilio_sid = ?").get(CallSid);
-  if (callRow) {
-    // if caller is mapped to a user, notify via WS
-    // For outbound: from_user = system, to_user = phone number (not always a user)
-    // For inbound bridging flows, you'd have to save the app user id in row and use connections map.
-    const userId = callRow.to_user; // adjust as per mapping
-    const ws = connections.get(userId);
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: "call_status", callId: callRow.call_id, status: CallStatus }));
+  const { CallSid, CallStatus, CallDuration } = req.body;
+  console.log(`📡 Twilio callback: ${CallSid} -> ${CallStatus}`);
+
+  try {
+    const call = getCallBySid(CallSid);
+    if (!call) {
+      console.warn(`⚠️ Unknown Twilio SID: ${CallSid}`);
+      updateCallStatusById(CallSid, CallStatus);
+      return res.sendStatus(200);
     }
+
+    updateCallStatusBySid(CallSid, CallStatus);
+    console.log(`✅ Updated ${call.call_id} (${CallSid}) -> ${CallStatus}`);
+
+    const ws = connections.get(call.to_user);
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "call_status", callId: call.call_id, status: CallStatus }));
+    }
+
+    res.sendStatus(200);
+
+  } catch (e) {
+    console.error("❌ Error processing status:", e);
+    res.status(500).json({ error: e.message });
   }
 
-  res.sendStatus(200);
 });
 
-// Incoming calls from Twilio (PSTN -> Twilio -> webhook)
+
+
+
+// Twilio webhook for Incoming PSTN call
 router.post("/twilio-inbound", async (req, res) => {
   const { From, To } = req.body;
-  console.log(`Inbound call ${From} -> ${To}`);
+  console.log(`📞 Incoming Twilio call: ${From} → ${To}`);
+
+  // 1. Find the registered user mapped to this Twilio number
   const user = getUserByPhone(To);
-  const callId = uuidv4();
 
   if (!user) {
-    console.log("Unknown destination number -> reject");
+    console.warn("⚠️ No app user found for number", To);
     const twiml = new VoiceResponse();
-    twiml.reject();
+    twiml.say("This number is not available. Goodbye.");
+    twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Save call record
+  // 2. Create a call record in DB
+  const callId = uuidv4();
   db.prepare(`
-    INSERT INTO call_logs (call_id, twilio_sid, from_user, to_user, direction, status)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(callId, null, From, user.user_id, "inbound", "ringing");
+    INSERT INTO call_logs (call_id, from_user, to_user, direction, status)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(callId, From, user.user_id, "inbound", "ringing");
 
-  // Send push (FCM) if token exists
+  // 3. Notify the app user via FCM push
   if (user.fcm_token) {
     await sendIncomingCallPush(user.fcm_token, From, callId);
+    console.log(`📲 Sent incoming call push to ${user.user_id}`);
   }
 
-  // Also if user is connected via websocket, notify directly
+  // 4. (Optional) Also notify the app in real-time if connected via WebSocket
   const ws = connections.get(user.user_id);
   if (ws && ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify({ type: "incoming_call", from: From, to: To, callId }));
+    ws.send(JSON.stringify({
+      type: "incoming_call",
+      from: From,
+      to: To,
+      callId: callId
+    }));
+    console.log(`🔔 Live incoming call sent via WebSocket to ${user.user_id}`);
   }
 
-  // Respond Twilio with waiting message
+  // 5. Tell Twilio to wait while app user decides
   const twiml = new VoiceResponse();
-  twiml.say("Please hold while we try to connect you.");
+  twiml.say("Please hold while we connect your call.");
   res.type("text/xml").send(twiml.toString());
 
-  // Auto-no-answer after 20s if still ringing
+  // 6. Auto-expire ringing call after 50 seconds if no answer
   setTimeout(() => {
-    const cur = db.prepare("SELECT status FROM call_logs WHERE call_id = ?").get(callId);
-    if (cur && cur.status === "ringing") {
+    const call = db.prepare("SELECT status FROM call_logs WHERE call_id = ?").get(callId);
+    if (call?.status === "ringing") {
       db.prepare("UPDATE call_logs SET status = ? WHERE call_id = ?").run("no-answer", callId);
-      console.log(`Auto-marked no-answer for ${callId}`);
-      // if Twilio call is active you may hangup via Twilio API using twilio SID (if available)
+      console.log(`⏰ Auto-marked no-answer for ${callId}`);
     }
-  }, 20000);
+  }, 50000);
+
 });
 
-// Endpoint to connect inbound call to an app / number (when caller accepts)
+
+
+
+
+// connect inbound call (when caller accepts)
 router.post("/connect-call", async (req, res) => {
   const { callId, userId } = req.body;
   console.log(`Connect call ${callId} for user ${userId}`);
-  // For production connect inbound call to the app via TwiML <Dial><Client>userId</Client></Dial>
-  // Example TwiML response:
+
   const twiml = new VoiceResponse();
   const dial = twiml.dial();
-  // If you are using Twilio Client (Programmable Voice SDK) you can dial a client identity:
-  dial.client(userId);
+  dial.client(userId); // dial.number("+15550001111");
   res.type("text/xml").send(twiml.toString());
+
 });
+
+
 
 // Hang up call by callId (optionally using Twilio SID)
 router.post("/hangup", async (req, res) => {
   const { callId } = req.body;
-  // Update DB and call Twilio to hang up if needed (requires twilio SID)
-  const row = db.prepare("SELECT * FROM call_logs WHERE call_id = ?").get(callId);
-  if (row && row.twilio_sid) {
-    try {
-      await client.calls(row.twilio_sid).update({ status: "completed" });
-      db.prepare("UPDATE call_logs SET status = ?, ended_at = CURRENT_TIMESTAMP WHERE call_id = ?").run("completed", callId);
-      return res.json({ success: true });
-    } catch (err) {
-      console.error("hangup error", err);
-      return res.status(500).json({ error: err.message });
+  try {
+    const call = getCallById(callId);
+    if (!call) {
+      return res.status(404).json({ success: false, message: "Call not found" });
     }
-  } else {
-    db.prepare("UPDATE call_logs SET status = ? WHERE call_id = ?").run("completed", callId);
-    return res.json({ success: true });
+
+    if (call.twilio_sid) {
+      await client.calls(call.twilio_sid).update({ status: "completed" });
+    }
+
+    updateCallStatusById(callId, "completed");
+    res.json({ success: true, message: "Call ended successfully" });
+
+  } catch (err) {
+    console.error("❌ Hangup error:", err.message);
+    updateCallStatusById(callId, "failed", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
+
 });
 
 export default router;
+

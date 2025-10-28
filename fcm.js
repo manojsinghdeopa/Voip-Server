@@ -18,20 +18,22 @@ export async function sendIncomingCallPush(targetToken, callerName, callId) {
     console.error("Firebase not initialized. Cannot send push.");
     return;
   }
+
   const message = {
     token: targetToken,
+    android: {
+      priority: "high",
+      ttl: 0, // immediate delivery, no caching
+    },
     data: {
       type: "incoming_call",
       callerName: callerName,
-      callId: callId
+      callId: callId,
+      timestamp: Date.now().toString(),
     },
-    android: {
-      priority: "high",
-      notification: {
-        channel_id: "voip_calls_channel"
-      }
-    }
   };
+
+
   try {
     const resp = await admin.messaging().send(message);
     console.log("FCM sent:", resp);
